@@ -288,9 +288,17 @@ def op_fetch(job):
         # not 200 characters) and a ratio (markup that is almost entirely script yields
         # almost no text). A short-but-real page still passes the ratio, and a long page
         # of pure javascript still fails the floor.
+        # THE RATIO ALONE REJECTS REAL PAGES. Live test 2026-08-21: a github issue is
+        # 290,235 bytes of application markup wrapping 3,896 characters of genuine
+        # discussion -- 1.3%, so the ratio test threw away four thousand characters of
+        # exactly what was asked for. A low ratio means the page is mostly machinery; it
+        # does NOT mean the page is empty. So the ratio only condemns a page that is
+        # ALSO short in absolute terms. The floor is what catches the real shells: the
+        # one that started this had 40 characters.
         floor = int(job.get("min_chars") or 400)
+        thin = int(job.get("thin_chars") or 1500)
         ratio = (len(text) / len(raw)) if raw else 0
-        if len(text) < floor or (len(raw) > 20000 and ratio < 0.02):
+        if len(text) < floor or (len(raw) > 20000 and ratio < 0.02 and len(text) < thin):
             failures.append({"url": u,
                 "error": "fetched %d bytes but only %d characters of text (%.1f%% of the "
                          "page) — this is a javascript-rendered shell, not an article"

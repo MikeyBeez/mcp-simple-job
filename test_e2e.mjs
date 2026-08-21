@@ -79,6 +79,11 @@ check('and it says the window followed the focus', /passages around/.test(aimed.
 const absent = await call('summarize', { url: FOCUS_URL, focus: 'kubernetes ingress controllers', max_words: 40 });
 check('a focus the page never discusses is reported, not answered', absent.ok === false && !!absent.focus_not_found,
       absent.focus_not_found ? '0 hits, reported' : JSON.stringify(absent).slice(0, 60));
+// With zero hits the excerpt falls back to the head, so the partial message must not
+// claim the window followed the focus -- that put two contradictory sentences in one
+// reply when it was seen live.
+check('and it does not also claim to have read passages around it',
+      !/passages around/.test(absent.partial || ''), absent.partial ? absent.partial.slice(0, 58) : '(none)');
 
 console.log('\n-- a javascript shell is not a page --');
 // Regression guard, 2026-08-21. This url serves 68,896 bytes of markup containing 40
@@ -89,6 +94,12 @@ const shell = await call('summarize', { url: 'https://www.braincuber.com/tutoria
 check('a js shell is refused, not summarised', shell.ok === false && shell.stage === 'fetch',
       shell.failures && shell.failures[0] ? shell.failures[0].error.slice(0, 70) : JSON.stringify(shell).slice(0, 70));
 check('and the refusal says why', /javascript-rendered shell/.test(JSON.stringify(shell)));
+// The opposite error: a github issue is 290,235 bytes of application markup wrapping
+// 3,896 characters of real discussion. A ratio test alone threw that away, so the ratio
+// now only condemns a page that is also short in absolute terms.
+const heavy = await call('summarize', { url: 'https://github.com/huggingface/transformers/issues/29503', max_words: 60 });
+check('a heavy page with real text is still read', heavy.ok === true,
+      heavy.ok ? `${heavy.fetched.pages[0].chars} chars of text kept` : heavy.error);
 
 console.log('\n-- download to mac and to pop, verified by sha --');
 const dm = await call('download', { url: 'https://speed.cloudflare.com/__down?bytes=2000000', host: 'mac', dest: '/tmp/sjdl', filename: 'a.bin', overwrite: true });

@@ -194,7 +194,12 @@ const TOOLS = {
       return { ...out, source_chars: source.length, ...(fetched ? { fetched } : {}),
                ...(dry ? { ok: false,
                      focus_not_found: `nothing on the page(s) matches "${a.focus}" — the summary above is of other material and does not answer it` } : {}),
-               ...(cut && cut.length ? { partial: a.focus
+               // Do not claim to have read "the passages around X" when there were no
+               // such passages. With zero hits the excerpt falls back to the head, and
+               // saying otherwise put two contradictory sentences in one reply --
+               // focus_not_found reporting nothing matched, beside a partial message
+               // claiming the window had followed the match. Seen live 2026-08-21.
+               ...(cut && cut.length ? { partial: (a.focus && !dry)
                      ? `page(s) exceeded the ${cut[0].summarised_first}-character limit, so this reads the passages around "${a.focus}" rather than the whole page`
                      : `${cut.length} page(s) were longer than the ${cut[0].summarised_first}-character limit; this summarises the beginning of them, not the whole page. Raise chars_per_page to cover more.` } : {}) };
     },
