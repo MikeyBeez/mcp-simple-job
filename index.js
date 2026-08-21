@@ -27,9 +27,14 @@ import { execFileSync } from 'node:child_process';
 import { ask, MODEL, DEFAULT_MAX_TOKENS } from './ornith.js';
 import { runCheck, CHECK_TYPES } from './checks.js';
 import { hands, search, SEARCH_POLICY } from './hands.js';
+import os from 'node:os';
+import path from 'node:path';
 
 // ---- ledger: so "did delegation earn its place?" is answerable from data ------------
-const DB = process.env.HARNESS_LEDGER || '/Users/bard/Code/harness/ledger.db';
+// Paths come from the environment with a $HOME-relative default, rather than being
+// baked in. This is partly hygiene before a public push and partly correctness: a
+// hardcoded home directory makes the server work on exactly one machine.
+const DB = process.env.HARNESS_LEDGER || path.join(os.homedir(), 'Code/harness/ledger.db');
 const SQLITE = ['/usr/bin/sqlite3', '/opt/homebrew/bin/sqlite3']
   .find(p => { try { return fs.existsSync(p); } catch { return false; } }) || 'sqlite3';
 const q = s => `'${String(s ?? '').replace(/'/g, "''")}'`;
@@ -49,7 +54,8 @@ sql(`CREATE TABLE IF NOT EXISTS delegations (
 // and back-filling a column with a guess destroys the only honest thing about old data.
 sql(`ALTER TABLE delegations ADD COLUMN kind TEXT;`);
 
-const trace = () => { try { return fs.readFileSync('/Users/bard/Code/harness/current_trace.txt', 'utf8').trim() || null; } catch { return null; } };
+const TRACE_FILE = process.env.HARNESS_TRACE || path.join(os.homedir(), 'Code/harness/current_trace.txt');
+const trace = () => { try { return fs.readFileSync(TRACE_FILE, 'utf8').trim() || null; } catch { return null; } };
 
 function logRow({ kind, task, checkType, model, reached, passed, why, tokens, tps, ms }) {
   sql(`INSERT INTO delegations(kind,task,check_type,model,reached,check_passed,why,tokens,tps,ms,trace_id)
