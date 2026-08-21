@@ -77,3 +77,39 @@ describe('a broken check never reads as a pass', () => {
     assert.match(r.why, /errored/);
   });
 });
+
+// --- summary_of, added 2026-08-21 with the summarize tool ---------------------------
+test('summary_of catches the two ways a summary fails', async (t) => {
+  const { runCheck } = await import('../checks.js');
+  const src = 'The quick brown fox. '.repeat(600);          // 12,600 chars
+
+  await t.test('a real summary passes', () => {
+    const out = 'A short note about a fox, repeated many times, described in a few dozen characters of prose rather than the whole thing.';
+    assert.equal(runCheck({ type: 'summary_of', source: src }, out).passed, true);
+  });
+  await t.test('handing the source back is not a summary', () => {
+    const r = runCheck({ type: 'summary_of', source: src }, src);
+    assert.equal(r.passed, false);
+    assert.match(r.why, /copied, not summarised/);
+  });
+  await t.test('quoting the opening verbatim is not a summary', () => {
+    const r = runCheck({ type: 'summary_of', source: src }, src.slice(0, 300));
+    assert.equal(r.passed, false);
+  });
+  await t.test('two words back from a long source is not a summary', () => {
+    const r = runCheck({ type: 'summary_of', source: src }, 'ok done');
+    assert.equal(r.passed, false);
+    assert.match(r.why, /too short/);
+  });
+  await t.test('the limit loosens for a short source, because short text does not compress', () => {
+    const little = 'x'.repeat(1200);
+    // 70% of a 1,200-character source: rejected under the old flat 60% rule, allowed now
+    assert.equal(runCheck({ type: 'summary_of', source: little }, 'y'.repeat(840)).passed, true);
+    // ...but the same 70% of a 20,000-character source is still far too much
+    const lots = 'x'.repeat(20000);
+    assert.equal(runCheck({ type: 'summary_of', source: lots }, 'y'.repeat(14000)).passed, false);
+  });
+  await t.test('a summary_of check with no source fails rather than passing blind', () => {
+    assert.equal(runCheck({ type: 'summary_of' }, 'anything').passed, false);
+  });
+});

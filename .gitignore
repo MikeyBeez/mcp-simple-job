@@ -1,3 +1,4 @@
 node_modules/
 *.bak
 *.bak-*
+.search_state.json
