@@ -26,7 +26,7 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { ask, MODEL, DEFAULT_MAX_TOKENS } from './ornith.js';
 import { runCheck, CHECK_TYPES } from './checks.js';
-import { hands, search, SEARCH_POLICY } from './hands.js';
+import { hands, search, SEARCH_POLICY, WORKER } from './hands.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -34,7 +34,17 @@ import path from 'node:path';
 // Paths come from the environment with a $HOME-relative default, rather than being
 // baked in. This is partly hygiene before a public push and partly correctness: a
 // hardcoded home directory makes the server work on exactly one machine.
-const DB = process.env.HARNESS_LEDGER || path.join(os.homedir(), 'Code/harness/ledger.db');
+// Default to the existing harness ledger when there is one, otherwise a private
+// directory. Picking one unconditionally either moves an existing ledger or creates
+// ~/Code/harness on the machine of someone who has never heard of it.
+const HARNESS_DIR = path.join(os.homedir(), 'Code/harness');
+const DB = process.env.HARNESS_LEDGER
+  || (fs.existsSync(HARNESS_DIR) ? path.join(HARNESS_DIR, 'ledger.db')
+                                 : path.join(os.homedir(), '.mcp-simple-job', 'ledger.db'));
+// sqlite3 will not create a missing PARENT directory -- it fails with "unable to open
+// database", sql() swallows it because logging must never break a job, and then every
+// delegation goes unrecorded while looking fine. Measured on a fresh path 2026-08-21.
+try { fs.mkdirSync(path.dirname(DB), { recursive: true }); } catch {}
 const SQLITE = ['/usr/bin/sqlite3', '/opt/homebrew/bin/sqlite3']
   .find(p => { try { return fs.existsSync(p); } catch { return false; } }) || 'sqlite3';
 const q = s => `'${String(s ?? '').replace(/'/g, "''")}'`;
@@ -161,7 +171,7 @@ const TOOLS = {
         // Fetched on pop: the bytes land on the machine that also holds the model, and
         // never touch this Mac's memory or Claude's context.
         const cap = a.chars_per_page || 8000;
-        const f = hands('pop', { op: 'fetch', urls, chars_per_page: cap, max_pages: urls.length,
+        const f = hands(WORKER, { op: 'fetch', urls, chars_per_page: cap, max_pages: urls.length,
                                  ...(a.focus ? { focus: a.focus } : {}) });
         if (!f.ok) return { ok: false, stage: 'fetch', error: f.error, failures: f.failures, ms: Date.now() - t0 };
         // A page can be far longer than what gets summarised, and a summary that quietly
@@ -242,7 +252,7 @@ const TOOLS = {
       if (a.results_only) return { ok: true, ...found, ms: Date.now() - t0 };
 
       const want = Math.min(Math.max(a.pages || 3, 1), 8);
-      const f = hands('pop', { op: 'fetch', urls: s.results.slice(0, want).map(r => r.url),
+      const f = hands(WORKER, { op: 'fetch', urls: s.results.slice(0, want).map(r => r.url),
                                chars_per_page: a.chars_per_page || 7000, max_pages: want,
                                focus: a.focus || a.query },
                       { timeout_ms: 120000 });
@@ -312,7 +322,11 @@ const TOOLS = {
     fn: (a = {}) => {
       const t0 = Date.now();
       if (!a.url) return { ok: false, error: 'url is required' };
-      const host = a.host === 'mac' ? 'mac' : 'pop';
+      // Default to the worker machine, but accept any configured host by name, and say
+      // so plainly rather than silently sending the file somewhere else.
+      const host = a.host ? String(a.host) : WORKER;
+      if (host !== 'mac' && !SEARCH_POLICY.HOSTS.includes(host))
+        return { ok: false, error: `unknown host "${host}" — configured hosts are: ${SEARCH_POLICY.HOSTS.join(', ')}` };
       const r = hands(host, { op: 'download', url: a.url, dest: a.dest, filename: a.filename,
                               overwrite: !!a.overwrite, max_mb: a.max_mb, timeout: 600 },
                       { timeout_ms: 900000 });
@@ -370,7 +384,14 @@ const TOOLS = {
                  note: jobs < 10 ? 'Too few jobs to judge yet.'
                      : passed / jobs < 0.6 ? 'Under 60% passing — either the tasks are too hard for ornith or the checks are wrong. Worth looking before delegating more.'
                      : 'Passing consistently. Delegation is earning its place.' };
-      } catch (e) { return { error: String(e.message) }; }
+      } catch (e) {
+        // A missing or unwritable ledger is not an error worth a stack trace at the
+        // caller. Before this it returned a raw sqlite3 command dump, which is what a
+        // brand-new install saw the first time it asked for stats.
+        return { jobs: 0, ledger: DB,
+                 note: 'No delegations recorded yet, or the ledger could not be read at ' + DB +
+                       '. Jobs still run — logging is best-effort by design and never blocks one.' };
+      }
     },
   },
 };

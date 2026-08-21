@@ -72,7 +72,12 @@ const GAP_MS   = Number(process.env.SEARCH_GAP_MS   || 30000);  // per host, bet
 const BLOCK_MS = Number(process.env.SEARCH_BLOCK_MS || 300000); // sit out this long after a throttle
 const MAX_WAIT_MS = Number(process.env.SEARCH_MAX_WAIT_MS || 45000);
 
-const HOSTS = ['mac', 'pop'];
+// THE SECOND MACHINE IS OPTIONAL. This was hardcoded to ['mac','pop'], which meant a
+// single-machine user's search failed on every other turn, trying to ssh somewhere that
+// does not exist. Alternating is an optimisation -- two IPs are two rate budgets -- not
+// a requirement. Set SEARCH_HOSTS=mac to run everything on one box; the gap and the
+// cooldown still apply, there is just nowhere to fail over to.
+const HOSTS = (process.env.SEARCH_HOSTS || 'mac,pop').split(',').map(h => h.trim()).filter(Boolean);
 const now = () => Date.now();
 
 function loadState() {
@@ -141,4 +146,11 @@ export function search(query, { count = 5, timeout_ms = 60000 } = {}) {
            `Retrying sooner tends to extend the block rather than clear it (measured 2026-08-21).` };
 }
 
-export const SEARCH_POLICY = { GAP_MS, BLOCK_MS, MAX_WAIT_MS, STATE_FILE, HOSTS };
+// WHICH MACHINE DOES THE FETCHING AND DOWNLOADING BY DEFAULT. The remote one when there
+// is a remote one, this one when there is not. Every fetch call site used to say 'pop'
+// literally, so on a single-machine install every summarize-from-url tried to ssh to a
+// host that does not exist. Alternating search across two machines is an optimisation;
+// needing a second machine at all is not a requirement of the design.
+export const WORKER = HOSTS.find(h => h !== 'mac') || 'mac';
+
+export const SEARCH_POLICY = { GAP_MS, BLOCK_MS, MAX_WAIT_MS, STATE_FILE, HOSTS, WORKER };
