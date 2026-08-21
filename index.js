@@ -155,14 +155,16 @@ const TOOLS = {
         // Fetched on pop: the bytes land on the machine that also holds the model, and
         // never touch this Mac's memory or Claude's context.
         const cap = a.chars_per_page || 8000;
-        const f = hands('pop', { op: 'fetch', urls, chars_per_page: cap, max_pages: urls.length });
+        const f = hands('pop', { op: 'fetch', urls, chars_per_page: cap, max_pages: urls.length,
+                                 ...(a.focus ? { focus: a.focus } : {}) });
         if (!f.ok) return { ok: false, stage: 'fetch', error: f.error, failures: f.failures, ms: Date.now() - t0 };
         // A page can be far longer than what gets summarised, and a summary that quietly
         // covers the first fifth of a document is a wrong answer wearing a right one.
         // Live test 2026-08-21: a wikipedia page was 40,063 characters, of which 8,084
         // reached the model. Both numbers were in the reply and neither was labelled.
         fetched = { pages: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars,
-                                               ...(p.truncated ? { summarised_first: cap } : {}) })),
+                                               ...(p.truncated ? { summarised_first: cap } : {}),
+                                               ...(a.focus ? { focus_hits: p.focus_hits } : {}) })),
                     failures: f.failures };
         source = [source, ...f.pages.map(p => `## ${p.title || p.url}\n${p.url}\n\n${p.text}`)].filter(Boolean).join('\n\n---\n\n');
       }
@@ -184,9 +186,17 @@ const TOOLS = {
       const out = runJob({ kind: 'summarize', prompt, context: source, check, t0,
                            a: { ...a, max_tokens: a.max_tokens || budget(source.length, words) } });
       const cut = fetched && fetched.pages.filter(p => p.summarised_first);
+      // ZERO HITS IS AN ANSWER, and a better one than a fluent summary of the wrong
+      // passage. If the page never uses the words the caller asked about, say that --
+      // the model, handed the material anyway, will write something plausible about
+      // whatever it did receive and nothing will mark it as off-target.
+      const dry = fetched && a.focus && fetched.pages.every(p => p.focus_hits === 0);
       return { ...out, source_chars: source.length, ...(fetched ? { fetched } : {}),
-               ...(cut && cut.length ? { partial: `${cut.length} page(s) were longer than the ${cut[0].summarised_first}-character limit; ` +
-                     `this summarises the beginning of them, not the whole page. Raise chars_per_page to cover more.` } : {}) };
+               ...(dry ? { ok: false,
+                     focus_not_found: `nothing on the page(s) matches "${a.focus}" — the summary above is of other material and does not answer it` } : {}),
+               ...(cut && cut.length ? { partial: a.focus
+                     ? `page(s) exceeded the ${cut[0].summarised_first}-character limit, so this reads the passages around "${a.focus}" rather than the whole page`
+                     : `${cut.length} page(s) were longer than the ${cut[0].summarised_first}-character limit; this summarises the beginning of them, not the whole page. Raise chars_per_page to cover more.` } : {}) };
     },
   },
 
@@ -222,7 +232,8 @@ const TOOLS = {
 
       const want = Math.min(Math.max(a.pages || 3, 1), 8);
       const f = hands('pop', { op: 'fetch', urls: s.results.slice(0, want).map(r => r.url),
-                               chars_per_page: a.chars_per_page || 7000, max_pages: want },
+                               chars_per_page: a.chars_per_page || 7000, max_pages: want,
+                               focus: a.focus || a.query },
                       { timeout_ms: 120000 });
       if (!f.ok)
         return { ok: false, stage: 'fetch', ...found,

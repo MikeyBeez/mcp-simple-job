@@ -66,6 +66,20 @@ check('it says what it read', !!su.fetched && su.fetched.pages.length === 1, su.
 const big = await call('summarize', { url: 'https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)', max_words: 120 });
 check('summarize a big page', big.ok === true, (big.check && big.check.why) || big.error);
 
+console.log('\n-- the reading window follows the question --');
+// Regression guard, 2026-08-21. "load balancing" first appears at character 16,181 of
+// this 40,063-character page and "sparse" at 14,671, both far past an 8,000-character
+// window. Blind head-truncation produced a fluent summary of the article's opening and
+// never mentioned that it had not seen the subject at all.
+const FOCUS_URL = 'https://en.wikipedia.org/wiki/Mixture_of_experts';
+const aimed = await call('summarize', { url: FOCUS_URL, focus: 'sparse gating and load balancing', max_words: 90 });
+check('a focused summary reaches material past the cut', aimed.ok === true && /load.balanc/i.test(aimed.output || ''),
+      aimed.ok ? `${aimed.fetched.pages[0].focus_hits} hits` : aimed.error);
+check('and it says the window followed the focus', /passages around/.test(aimed.partial || ''));
+const absent = await call('summarize', { url: FOCUS_URL, focus: 'kubernetes ingress controllers', max_words: 40 });
+check('a focus the page never discusses is reported, not answered', absent.ok === false && !!absent.focus_not_found,
+      absent.focus_not_found ? '0 hits, reported' : JSON.stringify(absent).slice(0, 60));
+
 console.log('\n-- a javascript shell is not a page --');
 // Regression guard, 2026-08-21. This url serves 68,896 bytes of markup containing 40
 // characters of text ("AI Search Book Free Audit Loading..."). Before the floor/ratio

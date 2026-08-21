@@ -172,6 +172,93 @@ def op_search(job):
             **({"ads_dropped": ads} if ads else {})}
 
 
+def _excerpt(text, cap, focus=None):
+    """Cut a long page down to `cap` characters -- around the FOCUS, not just the top.
+
+    BLIND TRUNCATION ANSWERS THE WRONG QUESTION AND DOES NOT SAY SO. Measured
+    2026-08-21: asked for "the sparse gating and load balancing problem" in a 40,063
+    character wikipedia page with an 8,000 character window, the model got the first
+    8,000 characters -- in which "load balancing" never appears (first at 16,181) and
+    "sparse" never appears (first at 14,671) -- and wrote a fluent summary of the
+    article's opening instead of saying the material did not cover it. Nothing was
+    wrong with the model's behaviour given what it was handed. It was handed the wrong
+    8,000 characters.
+
+    So the window follows the question: keep a head (context matters -- a passage with
+    no idea what the article is about summarises badly), then add the passages around
+    each match, in document order, until the budget is spent. Returns the excerpt and
+    the hit count, and a hit count of ZERO is the useful answer -- it means the page
+    does not discuss the thing, which the caller can state instead of guessing.
+    """
+    if len(text) <= cap:
+        return text, len(_terms(focus)) and _count(text, focus)
+    if not focus:
+        return text[:cap], 0
+    terms = _terms(focus)
+    if not terms:
+        return text[:cap], 0
+
+    # WORD BOUNDARIES, not substrings: matching "load" inside "download" and "upload"
+    # is how a first attempt reported 42 hits for four terms and filled the budget with
+    # noise before reaching the real passage.
+    spans, per_term = [], {}
+    for t in terms:
+        per_term[t] = [(max(0, m.start() - 600), min(len(text), m.start() + 900))
+                       for m in re.finditer(r"\b" + re.escape(t), text, re.I)]
+    hits = sum(len(v) for v in per_term.values())
+    if not hits:
+        return text[:cap], 0
+
+    # ONE WINDOW PER TERM FIRST, then the rest. Taking spans in document order spent the
+    # whole budget on early terms and never reached "load balancing" at character
+    # 16,181 -- the exact phrase that was asked about. A term the caller named is not
+    # optional just because it appears late in the document.
+    ordered = [v[0] for v in per_term.values() if v]
+    for v in per_term.values():
+        ordered.extend(v[1:])
+
+    head = min(cap // 4, 2000)          # enough to know what the document IS
+    # Budget the guaranteed one-per-term windows first, then extras, then sort what
+    # survived back into document order so the excerpt still reads front to back.
+    room, keep = cap - head, []
+    for span in ordered:
+        if room <= 0:
+            break
+        keep.append(span)
+        room -= (span[1] - span[0])
+    keep.append((0, head))
+    keep.sort()
+    merged = []
+    for a, b in keep:                   # overlapping windows would duplicate text
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+
+    out, used = [], 0
+    for a, b in merged:
+        if used >= cap:
+            break
+        piece = text[a:min(b, a + (cap - used))]
+        out.append(piece)
+        used += len(piece)
+    return "\n\n[...]\n\n".join(out), hits
+
+
+def _terms(focus):
+    if not focus:
+        return []
+    stop = {"the", "and", "for", "how", "why", "what", "does", "with", "from", "that",
+            "this", "are", "was", "its", "his", "her", "their", "when", "where", "which",
+            "problem", "about", "into", "than", "then", "they", "them", "have", "has"}
+    return [w for w in re.findall(r"[a-z0-9][a-z0-9-]{2,}", (focus or "").lower()) if w not in stop]
+
+
+def _count(text, focus):
+    low = text.lower()
+    return sum(low.count(t) for t in _terms(focus))
+
+
 def op_fetch(job):
     urls = job.get("urls") or ([job["url"]] if job.get("url") else [])
     if not urls:
@@ -209,9 +296,11 @@ def op_fetch(job):
                          "page) — this is a javascript-rendered shell, not an article"
                          % (len(raw), len(text), ratio * 100)})
             continue
+        excerpt, hits = _excerpt(text, per, job.get("focus"))
         pages.append({"url": final, "title": title_of(raw),
                       "chars": len(text), "truncated": len(text) > per,
-                      "text": text[:per]})
+                      "text": excerpt,
+                      **({"focus_hits": hits} if job.get("focus") else {})})
     return {"ok": bool(pages), "pages": pages, "failures": failures,
             **({} if pages else {"error": "no page could be read"})}
 

@@ -88,6 +88,38 @@ pop. The reasons are that pop holds the model, that pop is idle while the Mac is
 daily workstation in swap, and that a second machine is a second search budget. Choose a
 download's host by where the file is needed, not by throughput.
 
+## Reading follows the question
+
+A long page gets cut to fit the model's window. Cutting from the top answers the wrong
+question silently: asked about *"sparse gating and load balancing"* in a 40,063-character
+Wikipedia page with an 8,000-character window, the first attempt returned a fluent
+summary of the article's opening — in which "load balancing" never appears (it starts at
+character 16,181) and "sparse" never appears (14,671). Nothing marked it as off-target.
+
+So `focus` now steers the window: a head for context, then the passages around each term
+the caller named, one window guaranteed per term before any term gets a second. Same
+page, same budget, and the answer becomes top-k selection, noise for load balancing, and
+Switch Transformer at k=1.
+
+If the page never uses those words at all, the call returns `ok:false` with
+`focus_not_found`. Zero hits is a better answer than a plausible summary of other
+material.
+
+A page that is mostly script is refused rather than summarised: one site served 68,896
+bytes containing 40 characters of text ("Loading..."), which the old `if not text` guard
+passed, and the model duly wrote a confident benchmark figure citing it.
+
+## Citations are numbered so they can be checked
+
+`search_and_summarize` numbers the pages and asks for `[1]`, `[2]` rather than urls.
+Asked for urls, ornith attributed a figure it had read in a blog to the llama.cpp docs
+url — the fact was real and in the material, the attribution was not, and `summary_of`
+cannot see that because a mislabelled bullet is the right length and is not a copy.
+
+A url is a long opaque string to copy correctly. An integer is not, and it can be
+range-checked against the pages actually read — which the code does, failing the call on
+an out-of-range number and counting bullets that carry no source at all.
+
 ## Bad jobs
 
 Anything where "looks right" is the only test. Judgment calls. Code that must be correct.
