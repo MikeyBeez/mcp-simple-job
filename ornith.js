@@ -8,7 +8,7 @@ export const MODEL    = process.env.ORNITH_MODEL || 'ornith:35b';
 // Ornith is a REASONING model: it fills `reasoning_content` before `content`. A tight
 // max_tokens gets eaten by the thinking and the answer comes back empty with HTTP 200 —
 // which is precisely the silent success this server exists to catch. Budget generously.
-export const DEFAULT_MAX_TOKENS = 2048;
+export const DEFAULT_MAX_TOKENS = 2048;   // ample once thinking is off; see ask()
 
 const SYSTEM = (
   'You are handling a delegated subtask. Do exactly what is asked and nothing more. ' +
@@ -19,10 +19,22 @@ const SYSTEM = (
 
 /** Returns { ok, content, reasoning, tokens, tps, error }. Never throws. */
 export function ask(task, { context = '', max_tokens = DEFAULT_MAX_TOKENS, temperature = 0.2,
-                            model = MODEL, timeout_ms = 180000 } = {}) {
+                            model = MODEL, timeout_ms = 180000, think = false } = {}) {
   const user = context ? `${task}\n\n--- material ---\n${context}` : task;
+  // THINKING IS OFF BY DEFAULT, and that is a measurement, not a preference.
+  // Measured 2026-08-21 on a 1,570-character summarise job, three identical runs:
+  //   thinking on  -> 2 of 3 produced 5,500-6,000 characters of reasoning, hit the
+  //                   token ceiling, and returned an EMPTY answer with HTTP 200.
+  //   thinking off -> a clean 991-character answer in 258 tokens, finish_reason stop.
+  // A two-in-three silent-empty rate is not a budget problem to tune around; the
+  // thinking is simply not wanted for mechanical work. Every job this server accepts is
+  // mechanical by definition -- it has to carry a check -- so off is the right default.
+  // `reasoning_effort:"low"` and a "/no_think" system tag were both tried and neither
+  // stopped it: 843 and 907 characters of reasoning respectively. Only the template
+  // switch actually turns it off.
   const body = JSON.stringify({
     model, temperature, max_tokens,
+    ...(think ? {} : { chat_template_kwargs: { enable_thinking: false } }),
     messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }],
   });
   let raw;

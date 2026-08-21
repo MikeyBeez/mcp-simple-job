@@ -1,14 +1,23 @@
 #!/usr/bin/env node
 // mcp-simple-job — hand a CHECKABLE subtask to ornith on pop.
 //
-// Built 2026-08-19 at Mikey's suggestion. This is the delegation half of `elvis`,
-// retired earlier the same evening because side jobs started going to pop directly.
-// Two things are different: ornith now reaches every one of Mikey's MCP servers, so it
-// can act rather than only answer — and this version REFUSES work it cannot verify.
+// Built 2026-08-19. This is the delegation half of `elvis`, retired the same evening
+// because side jobs started going to pop directly.
 //
-// The rule: a job must carry its own check. Not because ornith is unreliable, but
-// because the caller cannot tell. Delegating without a check adds a second place where
-// a green light means nothing, and removing those is what the whole day was about.
+// THE RULE: a job carries its own check. Not because ornith is unreliable, but because
+// the caller cannot tell. Delegating without a check adds a second place where a green
+// light means nothing, and removing those is what this system spent 2026-08-19 doing.
+//
+// 2026-08-21, Mikey: "I don't want all the servers/tools unless they are running on pop.
+// Therefore we shouldn't need to spin up servers." That deleted a whole subsystem. The
+// previous plan started a copy of every wired MCP server per job — 21 processes on a
+// 16 GB Mac already in swap, including a copy of THIS server. Searching, fetching and
+// downloading are curl and a parser; they are pop_agent.py, run over ssh. See hands.js.
+//
+// Also his: "so perhaps we can only have one ddg websearch subtask. But we can have a
+// lot of other subtasks on pop." Exactly right, and it is the shape of this file. Search
+// is rationed because someone else's server rations it. Everything else on pop is bound
+// only by pop, and pop is idle.
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -17,41 +26,9 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { ask, MODEL, DEFAULT_MAX_TOKENS } from './ornith.js';
 import { runCheck, CHECK_TYPES } from './checks.js';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { hands, search, SEARCH_POLICY } from './hands.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-
-// TOOLS MODE. Without it ornith gets one message and returns one message — it cannot
-// search, fetch or read. That limitation was real and undeclared until Mikey asked why
-// the web searches had not been delegated. Answer: they could not be.
-//
-// The tool loop runs in delegate.py, reusing mcp_bridge.py — the same bridge the Brain
-// Monitor chat tab has been using for months. Porting a working bridge to Node to avoid
-// a subprocess would be rebuilding something that already runs.
-function askWithTools(task, opts = {}) {
-  const job = JSON.stringify({
-    task, context: opts.context || '',
-    allow_servers: opts.allow_servers || null,
-    pinned: opts.pinned || [],
-    max_steps: opts.max_steps || 8,
-    max_tokens: opts.max_tokens || 3000,
-    temperature: opts.temperature ?? 0.2,
-    model: opts.model || MODEL,
-  });
-  try {
-    const out = execFileSync('/usr/bin/python3', [path.join(HERE, 'delegate.py')], {
-      input: job, encoding: 'utf8', timeout: (opts.timeout_ms || 600000),
-      maxBuffer: 32 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return JSON.parse(out.trim().split('\n').filter(Boolean).pop());
-  } catch (e) {
-    return { ok: false, failures: [`the tool loop could not run: ${String(e.message).slice(0, 300)}`],
-             stopped_because: 'delegate.py failed to start or timed out' };
-  }
-}
-
-// ---- ledger: so "did delegation earn its place?" is answerable from data ----------
+// ---- ledger: so "did delegation earn its place?" is answerable from data ------------
 const DB = process.env.HARNESS_LEDGER || '/Users/bard/Code/harness/ledger.db';
 const SQLITE = ['/usr/bin/sqlite3', '/opt/homebrew/bin/sqlite3']
   .find(p => { try { return fs.existsSync(p); } catch { return false; } }) || 'sqlite3';
@@ -67,28 +44,77 @@ sql(`CREATE TABLE IF NOT EXISTS delegations (
   task TEXT, check_type TEXT, model TEXT,
   reached INTEGER, check_passed INTEGER, why TEXT,
   tokens INTEGER, tps REAL, ms INTEGER, trace_id TEXT);`);
+// Added 2026-08-21 when the server grew from one job type to four. Existing rows keep a
+// NULL kind rather than being rewritten as 'simple_job' — they predate the distinction,
+// and back-filling a column with a guess destroys the only honest thing about old data.
+sql(`ALTER TABLE delegations ADD COLUMN kind TEXT;`);
 
 const trace = () => { try { return fs.readFileSync('/Users/bard/Code/harness/current_trace.txt', 'utf8').trim() || null; } catch { return null; } };
 
+function logRow({ kind, task, check_type, model, reached, passed, why, tokens, tps, ms }) {
+  sql(`INSERT INTO delegations(kind,task,check_type,model,reached,check_passed,why,tokens,tps,ms,trace_id)
+       VALUES(${q(kind)},${q(String(task).slice(0, 300))},${q(check_type)},${q(model || MODEL)},
+              ${reached ? 1 : 0},${passed ? 1 : 0},${q(why)},${tokens || 0},${tps || 0},${ms},${q(trace())})`);
+}
+
+/** Ask ornith, run the check, log the row, shape the reply. The one path all jobs share. */
+function runJob({ kind, prompt, context, check, a, t0 }) {
+  const r = ask(prompt, { context, max_tokens: a.max_tokens, temperature: a.temperature,
+                          model: a.model, think: !!a.think });
+  const ms = Date.now() - t0;
+  if (!r.ok) {
+    logRow({ kind, task: prompt, check_type: check.type, model: a.model, reached: false, passed: false, why: r.error, ms });
+    return { ok: false, reached_ornith: false, error: r.error, ms };
+  }
+  const v = runCheck(check, r.content);
+  logRow({ kind, task: prompt, check_type: check.type, model: a.model, reached: true,
+           passed: v.passed, why: v.why, tokens: r.tokens, tps: r.tps, ms });
+  return {
+    ok: v.passed, output: r.content,
+    check: { type: check.type, passed: v.passed, why: v.why, ...(v.parsed ? { parsed: v.parsed } : {}) },
+    model: a.model || MODEL, tokens: r.tokens, tokens_per_second: r.tps && Math.round(r.tps), ms,
+    note: v.passed
+      ? 'Check passed. The output is verified only as far as the check is meaningful.'
+      : 'CHECK FAILED. Treat this output as unusable. Do the task yourself, or send a sharper task and a sharper check.',
+    ...(r.finish_reason === 'length' ? { truncated: 'ornith hit max_tokens — the answer may be cut off' } : {}),
+  };
+}
+
+// ORNITH REASONS BEFORE IT ANSWERS, and the reasoning comes out of the same budget as
+// the answer. A summarize call with max_tokens=2048 failed live on 2026-08-21: 2048
+// tokens of reasoning, zero tokens of answer, HTTP 200. The server caught it and said so
+// -- which is the point of the server -- but the right fix is not to make the caller
+// discover the number. Longer material makes it think longer, so the budget scales with
+// the material and stays generous: local tokens are free and a starved call costs a
+// whole round trip.
+function budget(sourceChars, wantWords = 200, floor = 3072) {
+  return Math.min(12000, Math.max(floor, Math.round(1200 + sourceChars / 3 + wantWords * 4)));
+}
+
+const COMMON = {
+  max_tokens:  { type: 'number', description: `Default ${DEFAULT_MAX_TOKENS}. Ornith reasons before answering; too low returns an empty answer.` },
+  temperature: { type: 'number' },
+  model:       { type: 'string', description: `Default ${MODEL}.` },
+  think:       { type: 'boolean', description: 'Let ornith reason before answering. Default false. Measured 2026-08-21: with reasoning on, 2 of 3 summarise runs returned an EMPTY answer after burning the whole token budget on thinking. Turn it on only for a job that genuinely needs deliberation, and raise max_tokens with it.' },
+};
+
 const TOOLS = {
+  // ---------------------------------------------------------------- 1. plain prompt
   simple_job: {
-    desc: 'Hand a subtask to ornith (35B, local, free) on pop and verify the result before returning it. ' +
+    desc: 'Hand a plain subtask to ornith (35B, local, free) on pop and verify the result before returning it. ' +
           'REQUIRES a check — a task that cannot state how it would be known to have worked is refused. ' +
-          'Good for: extraction against a schema, summarising, classifying, reformatting. ' +
+          'Good for: extraction against a schema, classifying, reformatting. ' +
           'Bad for: judgment calls, code that must be correct, editing files — do those yourself.',
     schema: {
       type: 'object',
       properties: {
         task:  { type: 'string', description: 'What ornith should do. Be specific about the output format.' },
         check: { type: 'object', description:
-          'How the result is verified. One of: ' +
-          '{type:"nonempty"} | {type:"contains",text,case_sensitive?} | {type:"regex",pattern,flags?} | ' +
-          '{type:"json_keys",required:[...]} | {type:"line_count",min?,max?} | ' +
+          'How the result is verified. One of: {type:"nonempty"} | {type:"contains",text,case_sensitive?} | ' +
+          '{type:"regex",pattern,flags?} | {type:"json_keys",required:[...]} | {type:"line_count",min?,max?} | ' +
           '{type:"shell",command:[argv...],timeout_ms?} (result is piped to stdin; exit 0 passes).' },
         context: { type: 'string', description: 'Material for the task — the text, rows or code to work on.' },
-        max_tokens: { type: 'number', description: `Default ${DEFAULT_MAX_TOKENS}. Ornith reasons before answering; too low returns an empty answer.` },
-        temperature: { type: 'number' },
-        model: { type: 'string', description: `Default ${MODEL}.` },
+        ...COMMON,
       },
       required: ['task', 'check'],
     },
@@ -99,48 +125,189 @@ const TOOLS = {
           'A check is required. simple_job will not delegate work it cannot verify — otherwise a ' +
           'reported success means nothing. Use one of: ' + CHECK_TYPES.join(', ') +
           '. If you cannot state how you would know it worked, it is not a simple job: do it yourself.' };
-
-      const t0 = Date.now();
-      const r = ask(a.task, { context: a.context, max_tokens: a.max_tokens,
-                              temperature: a.temperature, model: a.model });
-      const ms = Date.now() - t0;
-
-      if (!r.ok) {
-        sql(`INSERT INTO delegations(task,check_type,model,reached,check_passed,why,ms,trace_id)
-             VALUES(${q(a.task.slice(0,300))},${q(a.check.type)},${q(a.model||MODEL)},0,0,${q(r.error)},${ms},${q(trace())})`);
-        return { ok: false, reached_ornith: false, error: r.error, ms };
-      }
-
-      const v = runCheck(a.check, r.content);
-      sql(`INSERT INTO delegations(task,check_type,model,reached,check_passed,why,tokens,tps,ms,trace_id)
-           VALUES(${q(a.task.slice(0,300))},${q(a.check.type)},${q(a.model||MODEL)},1,${v.passed?1:0},
-                  ${q(v.why)},${r.tokens||0},${r.tps||0},${ms},${q(trace())})`);
-
-      return {
-        ok: v.passed, output: r.content,
-        check: { type: a.check.type, passed: v.passed, why: v.why, ...(v.parsed ? { parsed: v.parsed } : {}) },
-        model: a.model || MODEL, tokens: r.tokens, tokens_per_second: r.tps && Math.round(r.tps), ms,
-        note: v.passed
-          ? 'Check passed. The output is verified only to the extent the check is meaningful — a nonempty check proves very little.'
-          : 'CHECK FAILED. Treat this output as unusable. Do the task yourself, or send a sharper task and a sharper check.',
-        ...(r.finish_reason === 'length' ? { truncated: 'ornith hit max_tokens — the answer may be cut off' } : {}),
-      };
+      return runJob({ kind: 'simple_job', prompt: a.task, context: a.context, check: a.check, a, t0: Date.now() });
     },
   },
 
+  // ------------------------------------------------------------------- 2. summarize
+  summarize: {
+    desc: 'Summarise text with ornith on pop. Free, local, and it does not spend Claude context on the source. ' +
+          'Pass the text directly, or a url/urls to fetch first (fetched on pop). ' +
+          'The default check is a real one: the summary must be substantially shorter than the source and not a copy of it.',
+    schema: {
+      type: 'object',
+      properties: {
+        text:  { type: 'string', description: 'The material to summarise. Either this or url/urls.' },
+        url:   { type: 'string', description: 'Fetch this page on pop and summarise it.' },
+        urls:  { type: 'array', items: { type: 'string' }, description: 'Fetch several pages on pop and summarise them together.' },
+        focus: { type: 'string', description: 'What the summary should be about, if not everything. e.g. "only the benchmark numbers".' },
+        style: { type: 'string', description: '"bullets" (default) or "paragraph".' },
+        max_words: { type: 'number', description: 'Target length. Default 200.' },
+        check: { type: 'object', description: 'Optional. Defaults to {type:"summary_of"} against the source text.' },
+        ...COMMON,
+      },
+    },
+    fn: (a = {}) => {
+      const t0 = Date.now();
+      let source = a.text || '', fetched = null;
+      const urls = a.urls || (a.url ? [a.url] : []);
+      if (urls.length) {
+        // Fetched on pop: the bytes land on the machine that also holds the model, and
+        // never touch this Mac's memory or Claude's context.
+        const f = hands('pop', { op: 'fetch', urls, chars_per_page: a.chars_per_page || 8000, max_pages: urls.length });
+        if (!f.ok) return { ok: false, stage: 'fetch', error: f.error, failures: f.failures, ms: Date.now() - t0 };
+        fetched = { pages: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars })), failures: f.failures };
+        source = [source, ...f.pages.map(p => `## ${p.title || p.url}\n${p.url}\n\n${p.text}`)].filter(Boolean).join('\n\n---\n\n');
+      }
+      if (!String(source).trim())
+        return { ok: false, error: 'summarize needs `text`, `url` or `urls` — there is nothing to summarise' };
+
+      const words = a.max_words || 200;
+      const style = (a.style || 'bullets') === 'paragraph'
+        ? `Write a single prose paragraph of at most ${words} words.`
+        : `Write at most ${words} words as short bullet points, one fact per bullet.`;
+      const prompt = [
+        'Summarise the material below.', style,
+        a.focus ? `Cover only this: ${a.focus}` : 'Cover the main points and any concrete numbers.',
+        'Use only what the material says. Do not add outside knowledge and do not speculate.',
+      ].join(' ');
+
+      const check = a.check && a.check.type ? a.check : { type: 'summary_of', source };
+      if (check.type === 'summary_of' && !check.source) check.source = source;
+      const out = runJob({ kind: 'summarize', prompt, context: source, check, t0,
+                           a: { ...a, max_tokens: a.max_tokens || budget(source.length, words) } });
+      return { ...out, source_chars: source.length, ...(fetched ? { fetched } : {}) };
+    },
+  },
+
+  // -------------------------------------------------------- 3. search and summarize
+  search_and_summarize: {
+    desc: 'Search the web (DuckDuckGo), read the top pages on pop, and have ornith summarise them — one call, no Claude context spent on the raw pages. ' +
+          'THE ONLY SEARCH TOOL HERE, and deliberately: DuckDuckGo rate-limits hard, so searches are spaced and alternated between this Mac and pop. ' +
+          'A throttle is reported as a throttle, never as "no results".',
+    schema: {
+      type: 'object',
+      properties: {
+        query:  { type: 'string', description: 'The web search query.' },
+        focus:  { type: 'string', description: 'What you actually want to know, if narrower than the query.' },
+        pages:  { type: 'number', description: 'How many top results to read. Default 3, max 8. More pages costs seconds, not money.' },
+        count:  { type: 'number', description: 'How many search results to list. Default 6.' },
+        max_words: { type: 'number', description: 'Target summary length. Default 250.' },
+        results_only: { type: 'boolean', description: 'Skip reading and summarising; just return the search results.' },
+        check:  { type: 'object', description: 'Optional. Defaults to {type:"summary_of"} against the fetched pages.' },
+        ...COMMON,
+      },
+      required: ['query'],
+    },
+    fn: (a = {}) => {
+      const t0 = Date.now();
+      if (!a.query || !String(a.query).trim()) return { ok: false, error: 'query is required' };
+
+      const s = search(a.query, { count: Math.min(a.count || 6, 20) });
+      if (!s.ok) return { ok: false, stage: 'search', ...s, ms: Date.now() - t0 };
+      const found = { searched_from: s.host, waited_ms: s.waited_ms, results: s.results,
+                      ...(s.ads_dropped ? { ads_dropped: s.ads_dropped } : {}),
+                      ...(s.throttles ? { throttles: s.throttles } : {}) };
+      if (a.results_only) return { ok: true, ...found, ms: Date.now() - t0 };
+
+      const want = Math.min(Math.max(a.pages || 3, 1), 8);
+      const f = hands('pop', { op: 'fetch', urls: s.results.slice(0, want).map(r => r.url),
+                               chars_per_page: a.chars_per_page || 7000, max_pages: want },
+                      { timeout_ms: 120000 });
+      if (!f.ok)
+        return { ok: false, stage: 'fetch', ...found,
+                 error: 'search worked but no page could be read: ' + (f.error || ''),
+                 failures: f.failures, ms: Date.now() - t0 };
+
+      const source = f.pages.map(p => `## ${p.title || p.url}\n${p.url}\n\n${p.text}`).join('\n\n---\n\n');
+      const prompt = [
+        `Answer this using only the pages below: ${a.focus || a.query}`,
+        `At most ${a.max_words || 250} words, as short bullet points.`,
+        'Put the source url in brackets at the end of each bullet.',
+        'If the pages do not answer it, say so plainly instead of guessing.',
+      ].join(' ');
+
+      const check = a.check && a.check.type ? a.check : { type: 'summary_of', source };
+      if (check.type === 'summary_of' && !check.source) check.source = source;
+      const out = runJob({ kind: 'search_and_summarize', prompt, context: source, check, t0,
+                           a: { ...a, max_tokens: a.max_tokens || budget(source.length, a.max_words || 250) } });
+      return { ...out, ...found,
+               read: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars })),
+               ...(f.failures && f.failures.length ? { could_not_read: f.failures } : {}) };
+    },
+  },
+
+  // ------------------------------------------------------------------- 4. download
+  download: {
+    desc: 'Download a file to pop (default) or to this Mac. Returns the path, byte count and sha256 — a download that reports success without those is not verified. ' +
+          'Put it on pop when pop will use it (models, datasets, anything for the GPU); put it on the mac when you will open it.',
+    schema: {
+      type: 'object',
+      properties: {
+        url:  { type: 'string', description: 'http(s) url to download.' },
+        host: { type: 'string', description: '"pop" (default) or "mac". Measured 2026-08-21: the Mac is the faster of the two (17.5 vs 12.6 MB/s), so choose by where the file is needed, not by speed.' },
+        dest: { type: 'string', description: 'Directory on that machine. Default ~/Downloads.' },
+        filename: { type: 'string', description: 'Override the filename.' },
+        overwrite: { type: 'boolean', description: 'Replace an existing file. Default false — an existing file is an error, not a silent clobber.' },
+        max_mb: { type: 'number', description: 'Refuse anything larger. Default 500.' },
+        expect_sha256: { type: 'string', description: 'If given, the download fails unless the hash matches.' },
+      },
+      required: ['url'],
+    },
+    fn: (a = {}) => {
+      const t0 = Date.now();
+      if (!a.url) return { ok: false, error: 'url is required' };
+      const host = a.host === 'mac' ? 'mac' : 'pop';
+      const r = hands(host, { op: 'download', url: a.url, dest: a.dest, filename: a.filename,
+                              overwrite: !!a.overwrite, max_mb: a.max_mb, timeout: 600 },
+                      { timeout_ms: 900000 });
+      const ms = Date.now() - t0;
+      if (!r.ok) {
+        logRow({ kind: 'download', task: a.url, check_type: 'download', reached: false, passed: false, why: r.error, ms });
+        return { ...r, ms };
+      }
+      // A hash the caller supplied is the only check here that means anything.
+      if (a.expect_sha256 && a.expect_sha256.toLowerCase() !== r.sha256) {
+        logRow({ kind: 'download', task: a.url, check_type: 'sha256', reached: true, passed: false, why: 'sha mismatch', ms });
+        // `ok` LAST. Written as {ok:false, ...r} it was overwritten by r.ok===true, so
+        // a failed hash check returned ok:true WITH the mismatch error sitting beside
+        // it -- a green light next to the evidence against it, which is the exact
+        // failure this whole server exists to prevent. Caught by the e2e suite.
+        return { ...r, ok: false, ms,
+          error: `sha256 mismatch: expected ${a.expect_sha256.toLowerCase()}, got ${r.sha256}. The file is on disk but is NOT what you asked for.` };
+      }
+      logRow({ kind: 'download', task: a.url, check_type: a.expect_sha256 ? 'sha256' : 'bytes',
+               reached: true, passed: true, why: `${r.bytes} bytes`, ms });
+      return { ...r, ms, mb_per_second: +(r.bytes / 1e6 / (ms / 1000)).toFixed(1),
+               ...(a.expect_sha256 ? { sha256_verified: true } : {}),
+               note: `On ${host}, not on the other machine.` };
+    },
+  },
+
+  // ---------------------------------------------------------------------- 5. stats
   simple_job_stats: {
-    desc: 'How delegation to ornith has actually gone: jobs run, how often the check passed, and speed. Answers whether this server is earning its place.',
-    schema: { type: 'object', properties: { limit: { type: 'number' } } },
+    desc: 'How delegation has actually gone: jobs by kind, how often the check passed, and speed. Answers whether this server is earning its place.',
+    schema: { type: 'object', properties: {} },
     fn: () => {
       try {
-        const out = execFileSync(SQLITE, ['-batch', DB,
-          `SELECT COUNT(*)||'|'||COALESCE(SUM(reached),0)||'|'||COALESCE(SUM(check_passed),0)||'|'||
-           COALESCE(ROUND(AVG(ms)),0)||'|'||COALESCE(ROUND(AVG(tps),1),0) FROM delegations;`],
-          { encoding: 'utf8', timeout: 8000 }).trim().split('|');
-        const [jobs, reached, passed, avgMs, avgTps] = out.map(Number);
-        return { jobs, reached_ornith: reached, check_passed: passed,
-                 pass_rate: jobs ? Math.round(100 * passed / jobs) + '%' : 'n/a',
-                 avg_ms: avgMs, avg_tokens_per_second: avgTps,
+        const rows = execFileSync(SQLITE, ['-batch', DB,
+          `SELECT COALESCE(kind,'(before kinds existed)')||'|'||COUNT(*)||'|'||COALESCE(SUM(reached),0)||'|'||
+                  COALESCE(SUM(check_passed),0)||'|'||COALESCE(ROUND(AVG(ms)),0)||'|'||COALESCE(ROUND(AVG(tps),1),0)
+           FROM delegations GROUP BY kind ORDER BY COUNT(*) DESC;`],
+          { encoding: 'utf8', timeout: 8000 }).trim();
+        const by_kind = rows ? rows.split('\n').map(line => {
+          const [kind, jobs, reached, passed, avgMs, avgTps] = line.split('|');
+          return { kind, jobs: +jobs, reached_ornith: +reached, check_passed: +passed,
+                   pass_rate: +jobs ? Math.round(100 * passed / jobs) + '%' : 'n/a',
+                   avg_ms: +avgMs, avg_tokens_per_second: +avgTps };
+        }) : [];
+        const jobs = by_kind.reduce((n, k) => n + k.jobs, 0);
+        const passed = by_kind.reduce((n, k) => n + k.check_passed, 0);
+        return { jobs, check_passed: passed,
+                 pass_rate: jobs ? Math.round(100 * passed / jobs) + '%' : 'n/a', by_kind,
+                 search_policy: { gap_between_searches_s: SEARCH_POLICY.GAP_MS / 1000,
+                                  cooldown_after_throttle_s: SEARCH_POLICY.BLOCK_MS / 1000,
+                                  alternates_between: SEARCH_POLICY.HOSTS },
                  note: jobs < 10 ? 'Too few jobs to judge yet.'
                      : passed / jobs < 0.6 ? 'Under 60% passing — either the tasks are too hard for ornith or the checks are wrong. Worth looking before delegating more.'
                      : 'Passing consistently. Delegation is earning its place.' };
@@ -149,7 +316,7 @@ const TOOLS = {
   },
 };
 
-const server = new Server({ name: 'mcp-simple-job', version: '1.0.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'mcp-simple-job', version: '2.0.0' }, { capabilities: { tools: {} } });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: Object.entries(TOOLS).map(([name, t]) => ({ name, description: t.desc, inputSchema: t.schema })),
 }));
@@ -162,4 +329,4 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   return { content: [{ type: 'text', text: JSON.stringify(out, null, 1) }] };
 });
 await server.connect(new StdioServerTransport());
-console.error(`[simple-job] connected. ornith=${MODEL}`);
+console.error(`[simple-job] connected. ornith=${MODEL}, tools=${Object.keys(TOOLS).join(', ')}`);

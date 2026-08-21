@@ -2,7 +2,7 @@
 
 import { execFileSync } from 'node:child_process';
 
-export const CHECK_TYPES = ['contains', 'regex', 'json_keys', 'shell', 'nonempty', 'line_count'];
+export const CHECK_TYPES = ['contains', 'regex', 'json_keys', 'shell', 'nonempty', 'line_count', 'summary_of'];
 
 /**
  * Run `check` against ornith's `output`. Returns { passed, why }.
@@ -51,6 +51,36 @@ export function runCheck(check, output) {
         const { min = 0, max = Infinity } = check;
         const ok = n >= min && n <= max;
         return { passed: ok, why: `${n} lines (wanted ${min}..${max === Infinity ? '∞' : max})` };
+      }
+      case 'summary_of': {
+        // The default check for summarising, and a real one rather than a polite one.
+        // A summary has two failure modes a `nonempty` check waves straight through:
+        // the model hands back the source (or a chunk of it) instead of summarising,
+        // and the model emits a token or two and stops. Both return HTTP 200 and look
+        // like success. This catches both, cheaply, with no second model call.
+        const src = String(check.source ?? '');
+        if (!src) return { passed: false, why: 'summary_of needs the `source` it should be a summary of' };
+        const out = text.trim();
+        if (!out) return { passed: false, why: 'the model returned nothing' };
+        const ratio = out.length / src.length;
+        // THE LIMIT SCALES WITH THE SOURCE, because compressibility does. A flat 60%
+        // was tried first and rejected a perfectly good summary of this repo's own
+        // README: 1,570 dense characters in, ~960 out, 62%. There is not much fat in a
+        // short document to remove. A 100 KB page is a different matter entirely.
+        const max = check.max_ratio ?? (src.length < 2000 ? 0.85
+                                      : src.length < 10000 ? 0.6
+                                      : 0.35);
+        const min = check.min_chars ?? 80;
+        if (out.length < min && src.length > min * 4)
+          return { passed: false, why: `only ${out.length} characters back from ${src.length} — too short to be a summary` };
+        if (ratio > max)
+          return { passed: false, why: `output is ${Math.round(ratio * 100)}% the length of the source (limit ${Math.round(max * 100)}%) — it was probably copied, not summarised` };
+        // A verbatim run of a couple of sentences means it is quoting, not summarising.
+        const probe = src.replace(/\s+/g, ' ').trim().slice(0, 240);
+        if (probe.length > 120 && out.replace(/\s+/g, ' ').includes(probe))
+          return { passed: false, why: 'the output repeats the opening of the source verbatim' };
+        return { passed: true,
+                 why: `${out.length} characters from ${src.length} (${Math.round(ratio * 100)}% of the source, limit ${Math.round(max * 100)}%)` };
       }
       case 'shell': {
         // The strongest check: a real command, exit 0 is a pass. Never through a shell.
