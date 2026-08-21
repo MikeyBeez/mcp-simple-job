@@ -39,11 +39,40 @@ def die(msg, **extra):
     sys.exit(0)          # exit 0: the JSON carries the verdict, not the exit code
 
 
+class _Redirects(urllib.request.HTTPRedirectHandler):
+    """Follow 307 and 308 as well as the older codes.
+
+    THE TWO MACHINES DISAGREED WITHOUT THIS. Measured 2026-08-21: one url returned
+    "HTTP Error 308: Permanent Redirect" on the Mac and fetched fine on pop -- same file,
+    same argument, different answer. The Mac's system python is 3.9.6 and pop's is
+    3.12.3, and urllib only learned 308 in 3.11. That is the shell-out hardening problem
+    in its subtler form: not a missing binary, but the SAME command quietly behaving
+    differently depending on which machine ran it. A search that alternates machines
+    would have returned different pages from the same query, and nothing would have said
+    so. Handling it here makes the two hosts interchangeable, which the design assumes.
+    """
+    # Overriding redirect_request alone is NOT enough on 3.9: the handler is dispatched
+    # by method NAME, and 3.9 has no http_error_308 at all, so a 308 was raised as an
+    # error before any of this ran. Binding the name is the part that actually works.
+    http_error_308 = urllib.request.HTTPRedirectHandler.http_error_302
+
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        if code in (307, 308):
+            newreq = urllib.request.Request(newurl, data=req.data, headers=req.headers,
+                                            origin_req_host=req.origin_req_host, unverifiable=True)
+            newreq.get_method = req.get_method
+            return newreq
+        return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, hdrs, newurl)
+
+
+_OPENER = urllib.request.build_opener(_Redirects)
+
+
 def get(url, data=None, timeout=30, headers=None):
     h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
     h.update(headers or {})
     req = urllib.request.Request(url, data=data, headers=h)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         STATUS[0] = r.status
         # LOWERCASE THE KEYS. r.headers is a case-INSENSITIVE HTTPMessage; dict() turns
         # it into an ordinary case-SENSITIVE dict and silently throws that away. HTTP/2
@@ -160,9 +189,25 @@ def op_fetch(job):
             failures.append({"url": u, "error": "not text (%s)" % (ctype[:60] or "unknown")})
             continue
         text = to_text(raw)
-        if not text:
-            failures.append({"url": u, "error": "fetched %d bytes but no readable text "
-                                                "(likely javascript-rendered)" % len(raw)})
+        # A JAVASCRIPT SHELL IS NOT A PAGE, and it does not announce itself: HTTP 200,
+        # real bytes, and a handful of characters of chrome. Measured 2026-08-21 --
+        # braincuber.com returned 40 characters, "AI Search Book Free Audit Loading...",
+        # three times running. The old test was `if not text`, which 40 characters of
+        # nothing passes, so the shell went into a summary as though it were content and
+        # the model wrote a confident benchmark figure attributed to it. That is a silent
+        # success in the server built to refuse silent successes.
+        #
+        # Two tests, because either alone is fooled: an absolute floor (a real article is
+        # not 200 characters) and a ratio (markup that is almost entirely script yields
+        # almost no text). A short-but-real page still passes the ratio, and a long page
+        # of pure javascript still fails the floor.
+        floor = int(job.get("min_chars") or 400)
+        ratio = (len(text) / len(raw)) if raw else 0
+        if len(text) < floor or (len(raw) > 20000 and ratio < 0.02):
+            failures.append({"url": u,
+                "error": "fetched %d bytes but only %d characters of text (%.1f%% of the "
+                         "page) — this is a javascript-rendered shell, not an article"
+                         % (len(raw), len(text), ratio * 100)})
             continue
         pages.append({"url": final, "title": title_of(raw),
                       "chars": len(text), "truncated": len(text) > per,

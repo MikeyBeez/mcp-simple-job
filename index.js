@@ -154,9 +154,16 @@ const TOOLS = {
       if (urls.length) {
         // Fetched on pop: the bytes land on the machine that also holds the model, and
         // never touch this Mac's memory or Claude's context.
-        const f = hands('pop', { op: 'fetch', urls, chars_per_page: a.chars_per_page || 8000, max_pages: urls.length });
+        const cap = a.chars_per_page || 8000;
+        const f = hands('pop', { op: 'fetch', urls, chars_per_page: cap, max_pages: urls.length });
         if (!f.ok) return { ok: false, stage: 'fetch', error: f.error, failures: f.failures, ms: Date.now() - t0 };
-        fetched = { pages: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars })), failures: f.failures };
+        // A page can be far longer than what gets summarised, and a summary that quietly
+        // covers the first fifth of a document is a wrong answer wearing a right one.
+        // Live test 2026-08-21: a wikipedia page was 40,063 characters, of which 8,084
+        // reached the model. Both numbers were in the reply and neither was labelled.
+        fetched = { pages: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars,
+                                               ...(p.truncated ? { summarised_first: cap } : {}) })),
+                    failures: f.failures };
         source = [source, ...f.pages.map(p => `## ${p.title || p.url}\n${p.url}\n\n${p.text}`)].filter(Boolean).join('\n\n---\n\n');
       }
       if (!String(source).trim())
@@ -176,7 +183,10 @@ const TOOLS = {
       if (check.type === 'summary_of' && !check.source) check.source = source;
       const out = runJob({ kind: 'summarize', prompt, context: source, check, t0,
                            a: { ...a, max_tokens: a.max_tokens || budget(source.length, words) } });
-      return { ...out, source_chars: source.length, ...(fetched ? { fetched } : {}) };
+      const cut = fetched && fetched.pages.filter(p => p.summarised_first);
+      return { ...out, source_chars: source.length, ...(fetched ? { fetched } : {}),
+               ...(cut && cut.length ? { partial: `${cut.length} page(s) were longer than the ${cut[0].summarised_first}-character limit; ` +
+                     `this summarises the beginning of them, not the whole page. Raise chars_per_page to cover more.` } : {}) };
     },
   },
 
@@ -219,11 +229,21 @@ const TOOLS = {
                  error: 'search worked but no page could be read: ' + (f.error || ''),
                  failures: f.failures, ms: Date.now() - t0 };
 
-      const source = f.pages.map(p => `## ${p.title || p.url}\n${p.url}\n\n${p.text}`).join('\n\n---\n\n');
+      // PAGES ARE NUMBERED, AND THE NUMBERS ARE VERIFIED ON THE WAY BACK OUT.
+      // Live test 2026-08-21: asked for urls in brackets, ornith attributed a figure it
+      // had read in a blog to the llama.cpp docs url. The FACT was in the material --
+      // it did not invent anything -- but the attribution was wrong, and `summary_of`
+      // cannot see that, because a mislabelled bullet is the right length and is not a
+      // copy. A url is a long opaque string to copy correctly; "[2]" is not, and an
+      // index can be range-checked against the pages actually read. That turns an
+      // unverifiable claim into a verifiable one, which is the whole point of this
+      // server. The urls are put back below, by this code rather than by the model.
+      const source = f.pages.map((p, i) => `## [${i + 1}] ${p.title || p.url}\n${p.url}\n\n${p.text}`).join('\n\n---\n\n');
       const prompt = [
-        `Answer this using only the pages below: ${a.focus || a.query}`,
+        `Answer this using only the numbered pages below: ${a.focus || a.query}`,
         `At most ${a.max_words || 250} words, as short bullet points.`,
-        'Put the source url in brackets at the end of each bullet.',
+        `End every bullet with the number of the page it came from, in brackets, like [1]. ` +
+        `The pages are numbered 1 to ${f.pages.length}. Use only those numbers, and use the number of the page the fact is actually on.`,
         'If the pages do not answer it, say so plainly instead of guessing.',
       ].join(' ');
 
@@ -231,8 +251,21 @@ const TOOLS = {
       if (check.type === 'summary_of' && !check.source) check.source = source;
       const out = runJob({ kind: 'search_and_summarize', prompt, context: source, check, t0,
                            a: { ...a, max_tokens: a.max_tokens || budget(source.length, a.max_words || 250) } });
-      return { ...out, ...found,
-               read: f.pages.map(p => ({ url: p.url, title: p.title, chars: p.chars })),
+
+      const sources = f.pages.map((p, i) => ({ n: i + 1, url: p.url, title: p.title, chars: p.chars,
+                                               ...(p.truncated ? { read_only_first: source.length && true } : {}) }));
+      const cited = [...new Set([...(out.output || '').matchAll(/\[(\d+)\]/g)].map(m => +m[1]))];
+      const bogus = cited.filter(n => n < 1 || n > f.pages.length);
+      const lines = (out.output || '').split('\n').filter(l => /^\s*[-*]/.test(l));
+      const uncited = lines.filter(l => !/\[\d+\]/.test(l)).length;
+
+      return { ...out, ...found, sources,
+               citations: { cited_pages: cited.sort((x, y) => x - y),
+                            bullets: lines.length, bullets_without_a_source: uncited,
+                            ...(bogus.length ? { invalid: bogus } : {}) },
+               ...(bogus.length ? { ok: false,
+                     citation_error: `the summary cites page(s) ${bogus.join(', ')} but only ${f.pages.length} were read — treat the attributions as unreliable` } : {}),
+               ...(uncited ? { citation_warning: `${uncited} of ${lines.length} bullets carry no source number` } : {}),
                ...(f.failures && f.failures.length ? { could_not_read: f.failures } : {}) };
     },
   },
@@ -278,7 +311,11 @@ const TOOLS = {
       }
       logRow({ kind: 'download', task: a.url, checkType: a.expect_sha256 ? 'sha256' : 'bytes',
                reached: true, passed: true, why: `${r.bytes} bytes`, ms });
-      return { ...r, ms, mb_per_second: +(r.bytes / 1e6 / (ms / 1000)).toFixed(1),
+      // Below a megabyte the rate rounds to 0.0 and reads like a failure rather than a
+      // fast small file. Report a rate only where it means something; bytes and ms are
+      // always there.
+      const rate = r.bytes / 1e6 / (ms / 1000);
+      return { ...r, ms, ...(rate >= 0.1 ? { mb_per_second: +rate.toFixed(1) } : {}),
                ...(a.expect_sha256 ? { sha256_verified: true } : {}),
                note: `On ${host}, not on the other machine.` };
     },

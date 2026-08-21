@@ -66,6 +66,16 @@ check('it says what it read', !!su.fetched && su.fetched.pages.length === 1, su.
 const big = await call('summarize', { url: 'https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)', max_words: 120 });
 check('summarize a big page', big.ok === true, (big.check && big.check.why) || big.error);
 
+console.log('\n-- a javascript shell is not a page --');
+// Regression guard, 2026-08-21. This url serves 68,896 bytes of markup containing 40
+// characters of text ("AI Search Book Free Audit Loading..."). Before the floor/ratio
+// test it was accepted as a successful fetch and fed to the model as though it were an
+// article, and the model duly produced a confident benchmark figure citing it.
+const shell = await call('summarize', { url: 'https://www.braincuber.com/tutorial/how-to-use-multi-token-prediction-llama-cpp/' });
+check('a js shell is refused, not summarised', shell.ok === false && shell.stage === 'fetch',
+      shell.failures && shell.failures[0] ? shell.failures[0].error.slice(0, 70) : JSON.stringify(shell).slice(0, 70));
+check('and the refusal says why', /javascript-rendered shell/.test(JSON.stringify(shell)));
+
 console.log('\n-- download to mac and to pop, verified by sha --');
 const dm = await call('download', { url: 'https://speed.cloudflare.com/__down?bytes=2000000', host: 'mac', dest: '/tmp/sjdl', filename: 'a.bin', overwrite: true });
 check('download to mac ok', dm.ok === true, dm.ok ? `${dm.bytes} B @ ${dm.mb_per_second} MB/s -> ${dm.path}` : dm.error);
