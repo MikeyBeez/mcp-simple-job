@@ -51,9 +51,9 @@ sql(`ALTER TABLE delegations ADD COLUMN kind TEXT;`);
 
 const trace = () => { try { return fs.readFileSync('/Users/bard/Code/harness/current_trace.txt', 'utf8').trim() || null; } catch { return null; } };
 
-function logRow({ kind, task, check_type, model, reached, passed, why, tokens, tps, ms }) {
+function logRow({ kind, task, checkType, model, reached, passed, why, tokens, tps, ms }) {
   sql(`INSERT INTO delegations(kind,task,check_type,model,reached,check_passed,why,tokens,tps,ms,trace_id)
-       VALUES(${q(kind)},${q(String(task).slice(0, 300))},${q(check_type)},${q(model || MODEL)},
+       VALUES(${q(kind)},${q(String(task).slice(0, 300))},${q(checkType)},${q(model || MODEL)},
               ${reached ? 1 : 0},${passed ? 1 : 0},${q(why)},${tokens || 0},${tps || 0},${ms},${q(trace())})`);
 }
 
@@ -63,11 +63,11 @@ function runJob({ kind, prompt, context, check, a, t0 }) {
                           model: a.model, think: !!a.think });
   const ms = Date.now() - t0;
   if (!r.ok) {
-    logRow({ kind, task: prompt, check_type: check.type, model: a.model, reached: false, passed: false, why: r.error, ms });
+    logRow({ kind, task: prompt, checkType: check.type, model: a.model, reached: false, passed: false, why: r.error, ms });
     return { ok: false, reached_ornith: false, error: r.error, ms };
   }
   const v = runCheck(check, r.content);
-  logRow({ kind, task: prompt, check_type: check.type, model: a.model, reached: true,
+  logRow({ kind, task: prompt, checkType: check.type, model: a.model, reached: true,
            passed: v.passed, why: v.why, tokens: r.tokens, tps: r.tps, ms });
   return {
     ok: v.passed, output: r.content,
@@ -263,12 +263,12 @@ const TOOLS = {
                       { timeout_ms: 900000 });
       const ms = Date.now() - t0;
       if (!r.ok) {
-        logRow({ kind: 'download', task: a.url, check_type: 'download', reached: false, passed: false, why: r.error, ms });
+        logRow({ kind: 'download', task: a.url, checkType: 'download', reached: false, passed: false, why: r.error, ms });
         return { ...r, ms };
       }
       // A hash the caller supplied is the only check here that means anything.
       if (a.expect_sha256 && a.expect_sha256.toLowerCase() !== r.sha256) {
-        logRow({ kind: 'download', task: a.url, check_type: 'sha256', reached: true, passed: false, why: 'sha mismatch', ms });
+        logRow({ kind: 'download', task: a.url, checkType: 'sha256', reached: true, passed: false, why: 'sha mismatch', ms });
         // `ok` LAST. Written as {ok:false, ...r} it was overwritten by r.ok===true, so
         // a failed hash check returned ok:true WITH the mismatch error sitting beside
         // it -- a green light next to the evidence against it, which is the exact
@@ -276,7 +276,7 @@ const TOOLS = {
         return { ...r, ok: false, ms,
           error: `sha256 mismatch: expected ${a.expect_sha256.toLowerCase()}, got ${r.sha256}. The file is on disk but is NOT what you asked for.` };
       }
-      logRow({ kind: 'download', task: a.url, check_type: a.expect_sha256 ? 'sha256' : 'bytes',
+      logRow({ kind: 'download', task: a.url, checkType: a.expect_sha256 ? 'sha256' : 'bytes',
                reached: true, passed: true, why: `${r.bytes} bytes`, ms });
       return { ...r, ms, mb_per_second: +(r.bytes / 1e6 / (ms / 1000)).toFixed(1),
                ...(a.expect_sha256 ? { sha256_verified: true } : {}),
