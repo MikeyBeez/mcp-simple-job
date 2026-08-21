@@ -17,6 +17,39 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { ask, MODEL, DEFAULT_MAX_TOKENS } from './ornith.js';
 import { runCheck, CHECK_TYPES } from './checks.js';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// TOOLS MODE. Without it ornith gets one message and returns one message — it cannot
+// search, fetch or read. That limitation was real and undeclared until Mikey asked why
+// the web searches had not been delegated. Answer: they could not be.
+//
+// The tool loop runs in delegate.py, reusing mcp_bridge.py — the same bridge the Brain
+// Monitor chat tab has been using for months. Porting a working bridge to Node to avoid
+// a subprocess would be rebuilding something that already runs.
+function askWithTools(task, opts = {}) {
+  const job = JSON.stringify({
+    task, context: opts.context || '',
+    allow_servers: opts.allow_servers || null,
+    pinned: opts.pinned || [],
+    max_steps: opts.max_steps || 8,
+    max_tokens: opts.max_tokens || 3000,
+    temperature: opts.temperature ?? 0.2,
+    model: opts.model || MODEL,
+  });
+  try {
+    const out = execFileSync('/usr/bin/python3', [path.join(HERE, 'delegate.py')], {
+      input: job, encoding: 'utf8', timeout: (opts.timeout_ms || 600000),
+      maxBuffer: 32 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return JSON.parse(out.trim().split('\n').filter(Boolean).pop());
+  } catch (e) {
+    return { ok: false, failures: [`the tool loop could not run: ${String(e.message).slice(0, 300)}`],
+             stopped_because: 'delegate.py failed to start or timed out' };
+  }
+}
 
 // ---- ledger: so "did delegation earn its place?" is answerable from data ----------
 const DB = process.env.HARNESS_LEDGER || '/Users/bard/Code/harness/ledger.db';
