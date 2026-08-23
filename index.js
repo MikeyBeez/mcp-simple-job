@@ -27,6 +27,10 @@ import { execFileSync } from 'node:child_process';
 import { ask, MODEL, DEFAULT_MAX_TOKENS } from './ornith.js';
 import { runCheck, CHECK_TYPES } from './checks.js';
 import { hands, search, SEARCH_POLICY, WORKER } from './hands.js';
+// Date extraction lives in its own module so it can be unit-tested: this file starts
+// the MCP server at import time, so anything defined here is unreachable from a test.
+// See dates.js for why a page without a date cannot support the word "new".
+import { pageDating, dateLine } from './dates.js';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -225,7 +229,9 @@ const TOOLS = {
   search_and_summarize: {
     desc: 'Search the web (DuckDuckGo), read the top pages on pop, and have ornith summarise them — one call, no Claude context spent on the raw pages. ' +
           'THE ONLY SEARCH TOOL HERE, and deliberately: DuckDuckGo rate-limits hard, so searches are spaced and alternated between this Mac and pop. ' +
-          'A throttle is reported as a throttle, never as "no results".',
+          'A throttle is reported as a throttle, never as "no results". ' +
+          'DATES ARE EXTRACTED FROM EVERY PAGE and shown to the model, every bullet must carry one, and the reply reports what could not be dated — ' +
+          'because a page with no date cannot support the word "new". For a question about what is current, pass `since` and let it fail rather than hand back nine-month-old headlines.',
     schema: {
       type: 'object',
       properties: {
@@ -235,6 +241,7 @@ const TOOLS = {
         count:  { type: 'number', description: 'How many search results to list. Default 6.' },
         max_words: { type: 'number', description: 'Target summary length. Default 250.' },
         results_only: { type: 'boolean', description: 'Skip reading and summarising; just return the search results.' },
+        since:  { type: 'string', description: 'ISO date, e.g. "2026-07-01". USE THIS FOR ANY "what is new / latest / current" QUESTION. If every page read predates it, the call fails with staleness_error instead of returning confident old news. Dates are always extracted and reported; this makes them binding.' },
         check:  { type: 'object', description: 'Optional. Defaults to {type:"summary_of"} against the fetched pages.' },
         ...COMMON,
       },
@@ -270,12 +277,18 @@ const TOOLS = {
       // index can be range-checked against the pages actually read. That turns an
       // unverifiable claim into a verifiable one, which is the whole point of this
       // server. The urls are put back below, by this code rather than by the model.
-      const source = f.pages.map((p, i) => `## [${i + 1}] ${p.title || p.url}\n${p.url}\n\n${p.text}`).join('\n\n---\n\n');
+      const dating = f.pages.map(p => pageDating(p));
+      const source = f.pages.map((p, i) =>
+        `## [${i + 1}] ${p.title || p.url}\n${p.url}\n(${dateLine(dating[i])})\n\n${p.text}`).join('\n\n---\n\n');
       const prompt = [
         `Answer this using only the numbered pages below: ${a.focus || a.query}`,
         `At most ${a.max_words || 250} words, as short bullet points.`,
         `End every bullet with the number of the page it came from, in brackets, like [1]. ` +
         `The pages are numbered 1 to ${f.pages.length}. Use only those numbers, and use the number of the page the fact is actually on.`,
+        `Today is ${new Date().toISOString().slice(0, 10)}. Each page header states its date. ` +
+        `Give every bullet a date as well as a page number, like [1, 2026-08-13], using the date the page gives for that specific fact. ` +
+        `If the page gives no date for it, write [1, undated]. ` +
+        `Never call anything new, latest, recent or "this month" unless a date on the page supports it — if the newest date you can find for an item is months old, say how old it is instead.`,
         'If the pages do not answer it, say so plainly instead of guessing.',
       ].join(' ');
 
@@ -285,11 +298,31 @@ const TOOLS = {
                            a: { ...a, max_tokens: a.max_tokens || budget(source.length, a.max_words || 250) } });
 
       const sources = f.pages.map((p, i) => ({ n: i + 1, url: p.url, title: p.title, chars: p.chars,
+                                               date: dating[i].published,
+                                               dates_on_page: dating[i].found
+                                                 ? { oldest: dating[i].oldest, newest: dating[i].newest } : null,
                                                ...(p.truncated ? { read_only_first: source.length && true } : {}) }));
       const cited = [...new Set([...(out.output || '').matchAll(/\[(\d+)\]/g)].map(m => +m[1]))];
       const bogus = cited.filter(n => n < 1 || n > f.pages.length);
       const lines = (out.output || '').split('\n').filter(l => /^\s*[-*]/.test(l));
-      const uncited = lines.filter(l => !/\[\d+\]/.test(l)).length;
+      const uncited = lines.filter(l => !/\[\d+/.test(l)).length;
+
+      // THE DATE GATE. Three separate things can go wrong and they are reported
+      // separately, because they need different responses from the caller:
+      //   undated pages   -> the material could not support a freshness claim at all
+      //   stale newest    -> everything read predates `since`, so "new" is unsupportable
+      //   undated bullets -> the model wrote a claim it could not date
+      const today = new Date().toISOString().slice(0, 10);
+      const undatedPages = dating.filter(d => !d.published && !d.newest).length;
+      const newest = dating.map(d => d.newest || d.published).filter(Boolean).sort().pop() || null;
+      const stale = a.since && newest && newest < a.since;
+      const datedBullets = lines.filter(l => /\[\d+\s*,\s*(20\d{2}-\d{2}-\d{2}|undated)\s*\]/i.test(l)).length;
+      const dates = {
+        today, newest_date_read: newest,
+        pages_with_no_date: undatedPages,
+        bullets: lines.length, bullets_carrying_a_date: datedBullets,
+        ...(a.since ? { since: a.since } : {}),
+      };
 
       return { ...out, ...found, sources,
                citations: { cited_pages: cited.sort((x, y) => x - y),
@@ -298,6 +331,15 @@ const TOOLS = {
                ...(bogus.length ? { ok: false,
                      citation_error: `the summary cites page(s) ${bogus.join(', ')} but only ${f.pages.length} were read — treat the attributions as unreliable` } : {}),
                ...(uncited ? { citation_warning: `${uncited} of ${lines.length} bullets carry no source number` } : {}),
+               dates,
+               ...(stale ? { ok: false,
+                     staleness_error: `every page read is older than ${a.since} — the newest date found anywhere was ${newest}. Nothing here can support a claim about what is current; search again with a tighter query or a date filter.` } : {}),
+               ...(!stale && undatedPages === f.pages.length ? {
+                     staleness_warning: `none of the ${f.pages.length} pages read carries a date, so nothing below can be dated. Treat every item as of unknown age, and do not repeat it as new.` } : {}),
+               ...(!stale && undatedPages && undatedPages < f.pages.length ? {
+                     staleness_warning: `${undatedPages} of ${f.pages.length} pages carry no date; items taken from those cannot be dated.` } : {}),
+               ...(lines.length && datedBullets < lines.length ? {
+                     dating_warning: `${lines.length - datedBullets} of ${lines.length} bullets carry no date — those claims are undated, whatever they sound like.` } : {}),
                ...(f.failures && f.failures.length ? { could_not_read: f.failures } : {}) };
     },
   },
